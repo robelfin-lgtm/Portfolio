@@ -1,10 +1,14 @@
-import { StrictMode } from 'react'
-import { createRoot } from 'react-dom/client'
-import './index.css'
-import App from './App.jsx'
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import "./index.css";
+import App from "./App.jsx";
+import Admin from "./Admin.jsx";
 
-createRoot(document.getElementById('root')).render(
+const chemin = window.location.pathname.replace(/\/+$/, "");
+const Page = chemin === "/admin" ? Admin : App;
+
+createRoot(document.getElementById("root")).render(
   <StrictMode>
-    <App />
-  </StrictMode>,
-)
+    <Page />
+  </StrictMode>
+);
