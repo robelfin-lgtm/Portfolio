@@ -3,6 +3,7 @@ import React, { useEffect, useRef, useState } from "react";
 import "./App.css";
 
 const API = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
+const CONTACT_URL = "https://formspree.io/f/TON_ID";
 
 const projetsInitiaux = [
   {
@@ -183,23 +184,27 @@ const envoyerContact = async (event) => {
   setRetour("");
 
   try {
-    const reponse = await fetch(`${API}/api/contact`, {
+    const reponse = await fetch(CONTACT_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        Accept: "application/json",
       },
       body: JSON.stringify({
-        nom,
+        name: nom,
         email,
-        sujet,
+        _subject: sujet || "Message depuis le portfolio",
         message,
       }),
     });
 
-    const resultat = await reponse.json();
+    const resultat = await reponse.json().catch(() => ({}));
 
     if (!reponse.ok) {
-      throw new Error(resultat.detail || "Erreur lors de l'envoi.");
+      const detail = Array.isArray(resultat.errors)
+        ? resultat.errors.map((e) => e.message).join(", ")
+        : resultat.error;
+      throw new Error(detail || "Erreur lors de l'envoi.");
     }
 
     setRetour("Votre message a été envoyé avec succès !");
@@ -207,7 +212,6 @@ const envoyerContact = async (event) => {
     setEmail("");
     setSujet("");
     setMessage("");
-
   } catch (erreur) {
     setRetour("Échec de l'envoi : " + erreur.message);
   } finally {
