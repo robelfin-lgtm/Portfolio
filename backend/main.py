@@ -1,6 +1,7 @@
 
 import os
-import sqlite3
+import psycopg
+from psycopg.rows import dict_row
 import secrets
 import hashlib
 import json
@@ -21,7 +22,6 @@ from pwdlib import PasswordHash
 
 # CONFIGURATION
 DOSSIER = Path(__file__).resolve().parent
-DB_PATH = DOSSIER / "portfolio.db"
 UPLOAD_DIR = DOSSIER / "uploads" / "projets"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -58,7 +58,7 @@ app.add_middleware(
             FRONTEND_URL,
         ] if origin
     ],
-    allow_origin_regex=r"^https?://(localhost|127\\.0\\.0\\.1):5[0-9]{3}$",
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1):5[0-9]{3}$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -70,108 +70,18 @@ app.mount("/uploads", StaticFiles(directory=str(DOSSIER / "uploads")), name="upl
 
 # BASE DE DONNEES
 def obtenir_connexion():
-    connexion = sqlite3.connect(DB_PATH)
-    connexion.row_factory = sqlite3.Row
-    return connexion
+    database_url = os.getenv("DATABASE_URL", "").strip()
+
+    if not database_url:
+        raise RuntimeError("DATABASE_URL manquante.")
+
+    return psycopg.connect(
+        database_url,
+        row_factory=dict_row
+    )
 
 
-def initialiser_base():
-    with obtenir_connexion() as connexion:
-        connexion.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                nom TEXT NOT NULL,
-                email TEXT NOT NULL,
-                sujet TEXT NOT NULL,
-                message TEXT NOT NULL,
-                date_creation DATETIME DEFAULT CURRENT_TIMESTAMP,
-                lu INTEGER NOT NULL DEFAULT 0
-            )
-        """)
 
-        connexion.execute("""
-            CREATE TABLE IF NOT EXISTS admin_login_attempts (
-                ip TEXT PRIMARY KEY,
-                failed_attempts INTEGER NOT NULL DEFAULT 0,
-                locked_until TEXT
-            )
-        """)
-
-        connexion.execute("""
-            CREATE TABLE IF NOT EXISTS admin_sessions (
-                jti_hash TEXT PRIMARY KEY,
-                expires_at TEXT NOT NULL
-            )
-        """)
-
-
-        connexion.execute("""
-            CREATE TABLE IF NOT EXISTS projets (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                titre TEXT NOT NULL,
-                categorie TEXT NOT NULL,
-                description TEXT NOT NULL DEFAULT '',
-                technologies TEXT NOT NULL DEFAULT '[]',
-                date_creation DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        connexion.execute("""
-            CREATE TABLE IF NOT EXISTS projet_images (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                projet_id INTEGER NOT NULL,
-                chemin TEXT NOT NULL,
-                date_creation DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (projet_id) REFERENCES projets(id) ON DELETE CASCADE
-            )
-        """)
-
-        # Conserver les anciens projets de l'API
-        nombre_projets = connexion.execute(
-            "SELECT COUNT(*) FROM projets"
-        ).fetchone()[0]
-
-        if nombre_projets == 0:
-            anciens_projets = [
-                (
-                    "Infrastructure Active Directory",
-                    "Systèmes",
-                    "Mise en place et administration d'un environnement Active Directory.",
-                    ["Windows Server", "AD DS", "DNS", "GPO"]
-                ),
-                (
-                    "Simulation Réseau GNS3",
-                    "Réseaux",
-                    "Conception et simulation d'une infrastructure réseau.",
-                    ["GNS3", "TCP/IP", "Routage", "VLAN"]
-                ),
-                (
-                    "Application Web",
-                    "Développement",
-                    "Développement d'une application web avec React et FastAPI.",
-                    ["React", "Python", "FastAPI"]
-                )
-            ]
-
-            for titre, categorie, description, technologies in anciens_projets:
-                connexion.execute(
-                    """INSERT INTO projets
-                    (titre, categorie, description, technologies)
-                    VALUES (?, ?, ?, ?)""",
-                    (titre, categorie, description, json.dumps(technologies))
-                )
-
-        # Ajouter la colonne lu aux anciennes bases
-        colonnes = connexion.execute(
-            "PRAGMA table_info(messages)"
-        ).fetchall()
-
-        if not any(colonne["name"] == "lu" for colonne in colonnes):
-            connexion.execute("""
-                ALTER TABLE messages
-                ADD COLUMN lu INTEGER NOT NULL DEFAULT 0
-            """)
-initialiser_base()
 # MODELES
 class MessageContact(BaseModel):
     nom: str = Field(min_length=2, max_length=100)
@@ -232,7 +142,7 @@ def verifier_admin(
 
         with obtenir_connexion() as connexion:
             session = connexion.execute(
-                "SELECT expires_at FROM admin_sessions WHERE jti_hash = ?",
+                "SELECT expires_at FROM admin_sessions WHERE jti_hash = %s",
                 (empreinte,)
             ).fetchone()
 
@@ -245,7 +155,7 @@ def verifier_admin(
         if datetime.fromisoformat(session["expires_at"]) <= datetime.now(timezone.utc):
             with obtenir_connexion() as connexion:
                 connexion.execute(
-                    "DELETE FROM admin_sessions WHERE jti_hash = ?",
+                    "DELETE FROM admin_sessions WHERE jti_hash = %s",
                     (empreinte,)
                 )
             raise HTTPException(
@@ -295,7 +205,7 @@ TAILLE_MAX_IMAGE = 8 * 1024 * 1024
 
 def formater_projet(ligne, connexion):
     images = connexion.execute(
-        "SELECT id, chemin FROM projet_images WHERE projet_id = ? ORDER BY id",
+        "SELECT id, chemin FROM projet_images WHERE projet_id = %s ORDER BY id",
         (ligne["id"],)
     ).fetchall()
 
@@ -365,7 +275,7 @@ async def enregistrer_images(projet_id: int, images: list[UploadFile]):
 
             with obtenir_connexion() as connexion:
                 connexion.execute(
-                    "INSERT INTO projet_images (projet_id, chemin) VALUES (?, ?)",
+                    "INSERT INTO projet_images (projet_id, chemin) VALUES (%s, %s)",
                     (projet_id, nom_fichier)
                 )
 
@@ -400,16 +310,16 @@ async def ajouter_projet(
         curseur = connexion.execute(
             """INSERT INTO projets
             (titre, categorie, description, technologies)
-            VALUES (?, ?, ?, ?)""",
+            VALUES (%s, %s, %s, %s) RETURNING id""",
             (titre, categorie, description.strip(), json.dumps(liste_technologies))
         )
-        projet_id = curseur.lastrowid
+        projet_id = curseur.fetchone()["id"]
 
     await enregistrer_images(projet_id, images)
 
     with obtenir_connexion() as connexion:
         ligne = connexion.execute(
-            "SELECT * FROM projets WHERE id = ?", (projet_id,)
+            "SELECT * FROM projets WHERE id = %s", (projet_id,)
         ).fetchone()
         return {"message": "Projet ajouté.", "projet": formater_projet(ligne, connexion)}
 
@@ -426,7 +336,7 @@ async def modifier_projet(
 ):
     with obtenir_connexion() as connexion:
         existe = connexion.execute(
-            "SELECT id FROM projets WHERE id = ?", (projet_id,)
+            "SELECT id FROM projets WHERE id = %s", (projet_id,)
         ).fetchone()
 
         if existe is None:
@@ -434,8 +344,8 @@ async def modifier_projet(
 
         connexion.execute(
             """UPDATE projets
-            SET titre = ?, categorie = ?, description = ?, technologies = ?
-            WHERE id = ?""",
+            SET titre = %s, categorie = %s, description = %s, technologies = %s
+            WHERE id = %s""",
             (
                 titre.strip(),
                 categorie.strip(),
@@ -449,7 +359,7 @@ async def modifier_projet(
 
     with obtenir_connexion() as connexion:
         ligne = connexion.execute(
-            "SELECT * FROM projets WHERE id = ?", (projet_id,)
+            "SELECT * FROM projets WHERE id = %s", (projet_id,)
         ).fetchone()
         return {"message": "Projet modifié.", "projet": formater_projet(ligne, connexion)}
 
@@ -462,14 +372,14 @@ def supprimer_image(
 ):
     with obtenir_connexion() as connexion:
         image = connexion.execute(
-            "SELECT chemin FROM projet_images WHERE id = ? AND projet_id = ?",
+            "SELECT chemin FROM projet_images WHERE id = %s AND projet_id = %s",
             (image_id, projet_id)
         ).fetchone()
 
         if image is None:
             raise HTTPException(status_code=404, detail="Capture introuvable.")
 
-        connexion.execute("DELETE FROM projet_images WHERE id = ?", (image_id,))
+        connexion.execute("DELETE FROM projet_images WHERE id = %s", (image_id,))
 
     (UPLOAD_DIR / image["chemin"]).unlink(missing_ok=True)
     return {"message": "Capture supprimée."}
@@ -482,19 +392,19 @@ def supprimer_projet(
 ):
     with obtenir_connexion() as connexion:
         projet = connexion.execute(
-            "SELECT id FROM projets WHERE id = ?", (projet_id,)
+            "SELECT id FROM projets WHERE id = %s", (projet_id,)
         ).fetchone()
 
         if projet is None:
             raise HTTPException(status_code=404, detail="Projet introuvable.")
 
         images = connexion.execute(
-            "SELECT chemin FROM projet_images WHERE projet_id = ?",
+            "SELECT chemin FROM projet_images WHERE projet_id = %s",
             (projet_id,)
         ).fetchall()
 
-        connexion.execute("DELETE FROM projet_images WHERE projet_id = ?", (projet_id,))
-        connexion.execute("DELETE FROM projets WHERE id = ?", (projet_id,))
+        connexion.execute("DELETE FROM projet_images WHERE projet_id = %s", (projet_id,))
+        connexion.execute("DELETE FROM projets WHERE id = %s", (projet_id,))
 
     for image in images:
         (UPLOAD_DIR / image["chemin"]).unlink(missing_ok=True)
@@ -510,7 +420,8 @@ def envoyer_message(donnees: MessageContact):
             curseur = connexion.execute(
                 """
                 INSERT INTO messages (nom, email, sujet, message)
-                VALUES (?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id
                 """,
                 (
                     donnees.nom.strip(),
@@ -520,7 +431,7 @@ def envoyer_message(donnees: MessageContact):
                 )
             )
 
-            identifiant = curseur.lastrowid
+            identifiant = curseur.fetchone()["id"]
 
         return {
             "statut": "success",
@@ -528,7 +439,7 @@ def envoyer_message(donnees: MessageContact):
             "id": identifiant
         }
 
-    except sqlite3.Error:
+    except psycopg.Error:
         raise HTTPException(
             status_code=500,
             detail="Erreur lors de l'enregistrement du message."
@@ -551,7 +462,7 @@ def connexion_admin(donnees: ConnexionAdmin, request: Request):
 
     with obtenir_connexion() as connexion:
         tentative = connexion.execute(
-            "SELECT failed_attempts, locked_until FROM admin_login_attempts WHERE ip = ?",
+            "SELECT failed_attempts, locked_until FROM admin_login_attempts WHERE ip = %s",
             (adresse_ip,)
         ).fetchone()
 
@@ -567,7 +478,7 @@ def connexion_admin(donnees: ConnexionAdmin, request: Request):
                 )
 
             connexion.execute(
-                "DELETE FROM admin_login_attempts WHERE ip = ?",
+                "DELETE FROM admin_login_attempts WHERE ip = %s",
                 (adresse_ip,)
             )
 
@@ -587,7 +498,7 @@ def connexion_admin(donnees: ConnexionAdmin, request: Request):
     if not utilisateur_valide or not mot_de_passe_valide:
         with obtenir_connexion() as connexion:
             tentative = connexion.execute(
-                "SELECT failed_attempts FROM admin_login_attempts WHERE ip = ?",
+                "SELECT failed_attempts FROM admin_login_attempts WHERE ip = %s",
                 (adresse_ip,)
             ).fetchone()
 
@@ -602,7 +513,7 @@ def connexion_admin(donnees: ConnexionAdmin, request: Request):
             connexion.execute(
                 """
                 INSERT INTO admin_login_attempts (ip, failed_attempts, locked_until)
-                VALUES (?, ?, ?)
+                VALUES (%s, %s, %s)
                 ON CONFLICT(ip) DO UPDATE SET
                     failed_attempts = excluded.failed_attempts,
                     locked_until = excluded.locked_until
@@ -624,7 +535,7 @@ def connexion_admin(donnees: ConnexionAdmin, request: Request):
     # Une connexion réussie remet le compteur à zéro
     with obtenir_connexion() as connexion:
         connexion.execute(
-            "DELETE FROM admin_login_attempts WHERE ip = ?",
+            "DELETE FROM admin_login_attempts WHERE ip = %s",
             (adresse_ip,)
         )
 
@@ -650,11 +561,11 @@ def connexion_admin(donnees: ConnexionAdmin, request: Request):
 
     with obtenir_connexion() as connexion:
         connexion.execute(
-            "DELETE FROM admin_sessions WHERE expires_at <= ?",
+            "DELETE FROM admin_sessions WHERE expires_at <= %s",
             (datetime.now(timezone.utc).isoformat(),)
         )
         connexion.execute(
-            "INSERT INTO admin_sessions (jti_hash, expires_at) VALUES (?, ?)",
+            "INSERT INTO admin_sessions (jti_hash, expires_at) VALUES (%s, %s)",
             (empreinte, expiration.isoformat())
         )
 
@@ -687,7 +598,7 @@ def deconnexion_admin(
 
             with obtenir_connexion() as connexion:
                 connexion.execute(
-                    "DELETE FROM admin_sessions WHERE jti_hash = ?",
+                    "DELETE FROM admin_sessions WHERE jti_hash = %s",
                     (empreinte,)
                 )
 
@@ -708,12 +619,12 @@ def deconnexion_admin(
 def statistiques_admin(admin: str = Depends(verifier_admin)):
     with obtenir_connexion() as connexion:
         total = connexion.execute(
-            "SELECT COUNT(*) FROM messages"
-        ).fetchone()[0]
+            "SELECT COUNT(*) AS total FROM messages"
+        ).fetchone()["total"]
 
         non_lus = connexion.execute(
-            "SELECT COUNT(*) FROM messages WHERE lu = 0"
-        ).fetchone()[0]
+            "SELECT COUNT(*) AS total FROM messages WHERE lu = 0"
+        ).fetchone()["total"]
 
     return {
         "total_messages": total,
@@ -728,7 +639,7 @@ def modifier_statut_message(
 ):
     with obtenir_connexion() as connexion:
         curseur = connexion.execute(
-            "UPDATE messages SET lu = ? WHERE id = ?",
+            "UPDATE messages SET lu = %s WHERE id = %s",
             (1 if lu else 0, message_id)
         )
 
@@ -767,7 +678,7 @@ def supprimer_message(
 ):
     with obtenir_connexion() as connexion:
         curseur = connexion.execute(
-            "DELETE FROM messages WHERE id = ?",
+            "DELETE FROM messages WHERE id = %s",
             (message_id,)
         )
 
