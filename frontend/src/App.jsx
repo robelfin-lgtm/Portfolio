@@ -494,7 +494,7 @@ const envoyerContact = async (event) => {
 
         </div>
 
-    <form className="contact-form" onSubmit={envoyerContact}>
+    <form className="contact-form" action={CONTACT_URL} method="POST" onSubmit={envoyerContact}>
       <label>Votre nom</label>
       <input
         type="text"
